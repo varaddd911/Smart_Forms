@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from google import genai
@@ -12,16 +13,51 @@ from prompts import get_smart_form_prompt
 
 load_dotenv()
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    vertexai=False
-)
+
+def get_setting(name: str, default=None):
+    """Read config from the environment, then from Streamlit secrets.
+
+    A deployed app has no .env file, so on Streamlit Cloud the key comes from
+    the app's secrets instead.
+    """
+    value = os.getenv(name)
+
+    if value:
+        return value
+
+    try:
+        import streamlit as st
+
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+MODEL = get_setting("GEMINI_MODEL", DEFAULT_MODEL)
 
 
 class ExtractionError(RuntimeError):
     """The model did not return usable leave-request details for this turn."""
+
+
+class ConfigurationError(RuntimeError):
+    """The app has no API key to talk to Gemini with."""
+
+
+@lru_cache(maxsize=1)
+def get_client():
+    api_key = get_setting("GEMINI_API_KEY")
+
+    if not api_key:
+        raise ConfigurationError(
+            "GEMINI_API_KEY is not set. Add it to .env when running locally, or to "
+            "the app's secrets when deploying to Streamlit Cloud."
+        )
+
+    # vertexai=False keeps "AQ."-prefixed keys on the Gemini Developer API.
+    return genai.Client(api_key=api_key, vertexai=False)
 
 
 def extract_turn(
@@ -30,7 +66,7 @@ def extract_turn(
     awaiting=None,
 ) -> PartialLeaveRequest:
     try:
-        response = client.models.generate_content(
+        response = get_client().models.generate_content(
             model=MODEL,
             contents=user_input,
             config=types.GenerateContentConfig(

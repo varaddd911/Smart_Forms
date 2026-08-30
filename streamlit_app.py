@@ -4,7 +4,7 @@ import streamlit as st
 
 from conversation import ConversationState
 from flow import describe_changes, process_turn
-from llm_service import MODEL
+from llm_service import MODEL, ConfigurationError, get_client
 from models import FIELD_ORDER, REQUIRED_FIELDS
 from prompts import FIELD_LABELS, QUESTIONS
 
@@ -191,6 +191,12 @@ def main():
 
     st.title("Smart Forms")
     st.caption("Fill in a leave request by describing it in plain language.")
+
+    try:
+        get_client()
+    except ConfigurationError as exc:
+        st.error(str(exc))
+        st.stop()
 
     render_sidebar()
     render_history()

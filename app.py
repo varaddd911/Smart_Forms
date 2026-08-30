@@ -1,9 +1,16 @@
 from conversation import ConversationState
 from flow import describe_changes, process_turn
+from llm_service import ConfigurationError, get_client
 from prompts import FIELD_LABELS, QUESTIONS
 
 
 def main():
+    try:
+        get_client()
+    except ConfigurationError as exc:
+        print(exc)
+        return
+
     state = ConversationState()
     awaiting = None
 

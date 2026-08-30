@@ -107,6 +107,24 @@ python app.py
 
 Type `quit` to leave the CLI.
 
+## Deploying to Streamlit Cloud
+
+`.env` is gitignored, so a deployed app has no key and cannot read one from the
+environment. Supply it through the app's secrets instead: open the app on
+[share.streamlit.io](https://share.streamlit.io), go to **Settings > Secrets**, and add
+
+```toml
+GEMINI_API_KEY = "your_key_here"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+```
+
+`llm_service.get_setting` checks environment variables first and falls back to
+`st.secrets`, so the same code works locally and deployed. If the key is missing the
+app shows a message saying so rather than crashing with a traceback.
+
+To test secrets locally, put the same TOML in `.streamlit/secrets.toml` — that path is
+gitignored.
+
 ## Free tier quotas
 
 The Gemini free tier allows roughly 20 requests per day **per model**, and every
