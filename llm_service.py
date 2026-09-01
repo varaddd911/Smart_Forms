@@ -2,19 +2,16 @@ import os
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
-from pydantic import ValidationError
+from openai import APIError, OpenAI
 
 from models import PartialLeaveRequest
 from prompts import get_smart_form_prompt
 
 
-# override=True so a stale machine-level GEMINI_API_KEY cannot shadow .env.
+# override=True so a stale machine-level key cannot shadow .env.
 load_dotenv(override=True)
 
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_MODEL = "gpt-4o-mini"
 
 
 def get_setting(name: str, default=None):
@@ -36,7 +33,7 @@ def get_setting(name: str, default=None):
         return default
 
 
-MODEL = get_setting("GEMINI_MODEL", DEFAULT_MODEL)
+MODEL = get_setting("OPENAI_MODEL", DEFAULT_MODEL)
 
 
 class ExtractionError(RuntimeError):
@@ -44,7 +41,7 @@ class ExtractionError(RuntimeError):
 
 
 class ConfigurationError(RuntimeError):
-    """The app has no API key to talk to Gemini with."""
+    """The app has no API key to talk to OpenAI with."""
 
 
 def describe_config_sources() -> str:
@@ -54,12 +51,12 @@ def describe_config_sources() -> str:
     """
     notes = []
 
-    raw = os.environ.get("GEMINI_API_KEY")
+    raw = os.environ.get("OPENAI_API_KEY")
 
     if raw is None:
-        notes.append("no GEMINI_API_KEY environment variable")
+        notes.append("no OPENAI_API_KEY environment variable")
     elif not raw.strip():
-        notes.append("GEMINI_API_KEY environment variable is set but empty")
+        notes.append("OPENAI_API_KEY environment variable is set but empty")
 
     try:
         from dotenv import dotenv_values, find_dotenv
@@ -82,17 +79,16 @@ def describe_config_sources() -> str:
 
 @lru_cache(maxsize=1)
 def get_client():
-    api_key = get_setting("GEMINI_API_KEY")
+    api_key = get_setting("OPENAI_API_KEY")
 
     if not api_key:
         raise ConfigurationError(
-            "GEMINI_API_KEY is not set. Add it to .env when running locally, or to "
+            "OPENAI_API_KEY is not set. Add it to .env when running locally, or to "
             "the app's secrets when deploying to Streamlit Cloud. "
             f"Checked: {describe_config_sources()}."
         )
 
-    # vertexai=False keeps "AQ."-prefixed keys on the Gemini Developer API.
-    return genai.Client(api_key=api_key, vertexai=False)
+    return OpenAI(api_key=api_key)
 
 
 def extract_turn(
@@ -101,22 +97,23 @@ def extract_turn(
     awaiting=None,
 ) -> PartialLeaveRequest:
     try:
-        response = get_client().models.generate_content(
+        response = get_client().chat.completions.parse(
             model=MODEL,
-            contents=user_input,
-            config=types.GenerateContentConfig(
-                system_instruction=get_smart_form_prompt(known, awaiting),
-                response_mime_type="application/json",
-                response_schema=PartialLeaveRequest,
-            ),
+            messages=[
+                {"role": "system", "content": get_smart_form_prompt(known, awaiting)},
+                {"role": "user", "content": user_input},
+            ],
+            response_format=PartialLeaveRequest,
         )
     except APIError as exc:
         raise ExtractionError(str(exc)) from exc
 
-    if not response.text:
+    message = response.choices[0].message
+
+    if message.refusal:
+        raise ExtractionError(message.refusal)
+
+    if not message.parsed:
         raise ExtractionError("the model returned an empty response")
 
-    try:
-        return PartialLeaveRequest.model_validate_json(response.text)
-    except ValidationError as exc:
-        raise ExtractionError(exc.errors()[0]["msg"]) from exc
+    return message.parsed
