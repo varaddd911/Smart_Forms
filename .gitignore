@@ -2,5 +2,8 @@
 venv/
 env/
 .env
-.streamlit/secrets.toml
 __pycache__/
+.pytest_cache/
+debug.log
+debug.json
+output/

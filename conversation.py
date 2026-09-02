@@ -1,51 +1,43 @@
-from typing import Optional
-from datetime import date
+"""Conversation memory: keep the five fields across turns."""
 
-from models import FIELD_ORDER, REQUIRED_FIELDS, LeaveRequest, PartialLeaveRequest
+from typing import Optional
+
+from models import FIELDS, IntakeRecord, PartialIntakeRecord
 
 
 class ConversationState:
     def __init__(self):
-        self.employee_name: Optional[str] = None
-        self.employee_id: Optional[str] = None
-        self.leave_type: Optional[str] = None
-        self.start_date: Optional[date] = None
-        self.end_date: Optional[date] = None
-        self.reason: Optional[str] = None
+        self.query_type = None
+        self.regulation_ref = None
+        self.product_area = None
+        self.urgency = None
+        self.submitting_team = None
+        self.deadline_days = None
+        self.turns_taken = 0
+        self.awaiting_confirmation = False
+        self.pending_record: Optional[IntakeRecord] = None
 
-    def get_state(self):
-        return {field: getattr(self, field) for field in FIELD_ORDER}
+    def get_state(self) -> dict:
+        return {name: getattr(self, name) for name in FIELDS}
 
-    def update_from(self, partial: PartialLeaveRequest) -> list[str]:
-        """Apply one turn's extraction, ignoring fields the turn left empty.
-
-        Skipping None is what makes the conversation cumulative: a turn that only
-        mentions the leave type must not erase the name captured earlier.
-        """
+    def update_from(self, partial: PartialIntakeRecord) -> list[str]:
+        """Copy non-None values. None means 'not mentioned this turn'."""
         changed = []
-
-        for field, value in partial.model_dump().items():
-            if value is None or value == getattr(self, field):
+        data = partial.model_dump()
+        for name in FIELDS + ["deadline_days"]:
+            value = data.get(name)
+            if value is None or value == getattr(self, name):
                 continue
-
-            setattr(self, field, value)
-            changed.append(field)
-
+            setattr(self, name, value)
+            if name in FIELDS:
+                changed.append(name)
         return changed
 
-    def missing_required_fields(self):
-        return [
-            field
-            for field in REQUIRED_FIELDS
-            if getattr(self, field) is None
-        ]
+    def missing_required_fields(self) -> list[str]:
+        return [name for name in FIELDS if getattr(self, name) is None]
 
-    def is_complete(self) -> bool:
-        return not self.missing_required_fields()
+    def to_intake_record(self) -> IntakeRecord:
+        return IntakeRecord.model_validate(self.get_state())
 
-    def to_leave_request(self) -> LeaveRequest:
-        return LeaveRequest.model_validate(self.get_state())
-
-    def clear(self, *fields: str) -> None:
-        for field in fields:
-            setattr(self, field, None)
+    def reset(self) -> None:
+        self.__init__()

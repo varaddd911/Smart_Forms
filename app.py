@@ -14,8 +14,7 @@ def main():
     state = ConversationState()
     awaiting = None
 
-    print("Smart Forms leave assistant. Describe your leave request.")
-    print("Type 'quit' to exit.\n")
+    print("SmartIntake. Describe a regulatory query. Type 'quit' to exit.\n")
 
     while True:
         try:
@@ -26,27 +25,34 @@ def main():
 
         if not user_input:
             continue
-
         if user_input.lower() in {"quit", "exit"}:
             break
 
         result = process_turn(state, user_input, awaiting)
         awaiting = result.next_field
 
-        if result.error:
+        if result.saved_path:
+            print("Assistant: Intake saved successfully.")
+            print(f"Assistant: Saved to {result.saved_path}")
+        elif result.error:
             print(f"Assistant: Sorry, {result.error}.")
-        elif result.submitted:
-            print("\nAssistant: That is submitted. Start another request or type 'quit'.")
+        elif result.out_of_scope:
+            print(f"Assistant: {result.fallback_message}")
+            if result.confirmation_message:
+                print(f"Assistant: {result.confirmation_message}")
+        elif result.awaiting_confirmation:
+            print(f"\nAssistant: {result.confirmation_message}")
         elif result.changed:
             print(f"Assistant: Got {describe_changes(result.changed, result.values)}.")
         elif result.unrecognised:
-            label = FIELD_LABELS[result.unrecognised].lower()
-            print(f"Assistant: That does not look like a {label}.")
+            print(f"Assistant: That does not look like a {FIELD_LABELS[result.unrecognised].lower()}.")
         else:
             print("Assistant: I did not catch any new details there.")
 
-        if awaiting:
+        if awaiting and not result.awaiting_confirmation and not result.saved_path:
             print(f"Assistant: {QUESTIONS[awaiting]}")
+        elif result.awaiting_confirmation and result.error:
+            print(f"Assistant: {result.confirmation_message}")
 
         print()
 

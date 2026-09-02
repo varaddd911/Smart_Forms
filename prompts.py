@@ -1,66 +1,83 @@
-from datetime import date
+"""Prompt, labels, and follow-up questions."""
 
-from models import LEAVE_TYPES
+from models import PRODUCT_AREAS, QUERY_TYPES, REGULATION_REFS
 
 FIELD_LABELS = {
-    "employee_name": "Employee name",
-    "employee_id": "Employee ID",
-    "leave_type": "Leave type",
-    "start_date": "Start date",
-    "end_date": "End date",
-    "reason": "Reason",
+    "query_type": "Query type",
+    "regulation_ref": "Regulation reference",
+    "product_area": "Product area",
+    "urgency": "Urgency",
+    "submitting_team": "Submitting team",
 }
 
 QUESTIONS = {
-    "employee_name": "What is your name?",
-    "employee_id": "What is your employee ID?",
-    "leave_type": f"What type of leave is this ({', '.join(LEAVE_TYPES)})?",
-    "start_date": "Which date does the leave start?",
-    "end_date": "Which date does the leave end?",
-    "reason": "What is the reason for the leave?",
+    "query_type": (
+        "Is this a complaint, submission, variation, safety signal, "
+        "label update, inspection, or general enquiry?"
+    ),
+    "regulation_ref": "Which regulatory framework applies, if known?",
+    "product_area": (
+        "Which product area is this: oncology, cardiovascular, "
+        "infectious disease, CMC, clinical, labelling, or general?"
+    ),
+    "urgency": "What is the actual regulatory deadline or required response date?",
+    "submitting_team": (
+        "Which team is submitting this: PV, CMC, Clinical, Labelling, Submissions, or another team?"
+    ),
 }
 
+OUT_OF_SCOPE_MESSAGE = (
+    "SmartIntake is for pharmaceutical regulatory-affairs intake. "
+    "Please describe a regulatory query."
+)
 
-def get_smart_form_prompt(known=None, awaiting=None) -> str:
-    today = date.today()
 
-    prompt = f"""
-You are a Smart Form assistant collecting an employee leave request across
-several turns of conversation.
+def get_smart_form_prompt(known=None, awaiting=None, deadline_days=None) -> str:
+    filled = []
+    for name, label in FIELD_LABELS.items():
+        value = (known or {}).get(name)
+        if value is not None:
+            filled.append(f"- {label}: {value}")
+    recorded = "\n".join(filled) if filled else "nothing yet"
 
-Today's date is {today.strftime("%Y-%m-%d")}.
+    hint = ""
+    if awaiting:
+        hint = f"\nThe user is answering: {FIELD_LABELS.get(awaiting, awaiting)}."
+    if deadline_days is not None:
+        hint += f"\nKnown deadline: {deadline_days} day(s) from today."
 
-Read the user's latest message and return the leave-request details it contains.
+    return f"""
+You are a pharmaceutical regulatory-affairs intake assistant.
+
+Extract only what the latest user message actually says.
+Return structured fields. Do not invent missing information.
+
+Fields:
+- query_type: {", ".join(QUERY_TYPES)}
+- regulation_ref: {", ".join(REGULATION_REFS)}
+- product_area: {", ".join(PRODUCT_AREAS)}
+- urgency: always null (Python sets this from deadline_days)
+- submitting_team: a team name, never a person
+- deadline_days: days until the stated deadline (tomorrow=1). Null if none.
+- out_of_scope: true only if this is not a regulatory-affairs request
 
 Rules:
-1. Return null for every field the latest message does not mention.
-2. Never invent information. Extract only what the user states.
-3. Dates must be returned in YYYY-MM-DD format.
-4. If a date has no year, choose the reading closest to today's date.
-   Never return a year in the past.
-5. If the user changes a value that is already recorded, return the new value.
-6. The user may answer with a bare value such as "E1024" or "next Monday".
-   Read it as the answer to the question that was just asked.
-7. Leave type must be exactly one of: {", ".join(LEAVE_TYPES)}.
-8. Return null when an answer is not a plausible value for the field, even if it
-   was given in reply to a direct question. A stray character such as "w" or "asdf"
-   is not an answer. Never force an unclear reply into a field.
-"""
+- Null means "not in this message". Do not overwrite known values with null.
+- If the regulation is named but not in the list (for example MHRA), use other.
+- If the user does not know the regulation, return null.
+- Do not set deadline_days from words like ASAP or urgent. Only a real date/deadline counts.
+- product_area is the product/therapeutic area, not the submitting team.
+- If this is not a regulatory query, set out_of_scope true and leave other fields null.
 
-    filled = {
-        field: value
-        for field, value in (known or {}).items()
-        if value is not None
-    }
+Already recorded:
+{recorded}
+{hint}
 
-    if filled:
-        recorded = "\n".join(
-            f"- {FIELD_LABELS[field]}: {value}"
-            for field, value in filled.items()
-        )
-        prompt += f"\nAlready recorded:\n{recorded}\n"
+Example 1
+User: "We received an FDA inspection observation related to our manufacturing process. The response is due in 10 days. CMC will handle it."
+query_type=inspection, regulation_ref=FDA_21CFR, product_area=cmc, submitting_team=CMC, deadline_days=10, urgency=null
 
-    if awaiting:
-        prompt += f"\nThe question just asked was: {FIELD_LABELS[awaiting]}\n"
-
-    return prompt
+Example 2
+User: "We have a safety concern in a clinical trial but I'm not sure which regulatory framework applies. The Clinical team is handling it."
+query_type=safety_signal, regulation_ref=null, product_area=clinical, submitting_team=Clinical, deadline_days=null, urgency=null
+""".strip()

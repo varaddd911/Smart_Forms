@@ -1,119 +1,77 @@
+"""OpenAI SDK extraction. No LangChain."""
+
 import os
+import time
 from functools import lru_cache
 
 from dotenv import load_dotenv
 from openai import APIError, OpenAI
 
-from models import PartialLeaveRequest
+from audit import log_error, log_llm_usage
+from models import PartialIntakeRecord
 from prompts import get_smart_form_prompt
 
-
-# override=True so a stale machine-level key cannot shadow .env.
 load_dotenv(override=True)
 
-DEFAULT_MODEL = "gpt-4o-mini"
-
-
-def get_setting(name: str, default=None):
-    """Read config from the environment, then from Streamlit secrets.
-
-    A deployed app has no .env file, so on Streamlit Cloud the key comes from
-    the app's secrets instead.
-    """
-    value = os.getenv(name)
-
-    if value:
-        return value
-
-    try:
-        import streamlit as st
-
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
-
-MODEL = get_setting("OPENAI_MODEL", DEFAULT_MODEL)
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_RETRIES = 2
+MAX_TOKENS = 400
 
 
 class ExtractionError(RuntimeError):
-    """The model did not return usable leave-request details for this turn."""
+    pass
 
 
 class ConfigurationError(RuntimeError):
-    """The app has no API key to talk to OpenAI with."""
-
-
-def describe_config_sources() -> str:
-    """Report where config was looked for, naming no values.
-
-    A deployed app gives no other way to see why a key was not picked up.
-    """
-    notes = []
-
-    raw = os.environ.get("OPENAI_API_KEY")
-
-    if raw is None:
-        notes.append("no OPENAI_API_KEY environment variable")
-    elif not raw.strip():
-        notes.append("OPENAI_API_KEY environment variable is set but empty")
-
-    try:
-        from dotenv import dotenv_values, find_dotenv
-
-        path = find_dotenv()
-        found = list(dotenv_values(path)) if path else []
-        notes.append(f".env at {path or '<none found>'} defines: {found or 'nothing'}")
-    except Exception:
-        notes.append(".env could not be read")
-
-    try:
-        import streamlit as st
-
-        notes.append(f"secrets define: {list(st.secrets.keys()) or 'nothing'}")
-    except Exception:
-        notes.append("no Streamlit secrets available")
-
-    return "; ".join(notes)
+    pass
 
 
 @lru_cache(maxsize=1)
 def get_client():
-    api_key = get_setting("OPENAI_API_KEY")
-
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise ConfigurationError(
-            "OPENAI_API_KEY is not set. Add it to .env when running locally, or to "
-            "the app's secrets when deploying to Streamlit Cloud. "
-            f"Checked: {describe_config_sources()}."
-        )
-
+        raise ConfigurationError("OPENAI_API_KEY is not set. Add it to .env.")
     return OpenAI(api_key=api_key)
 
 
-def extract_turn(
-    user_input: str,
-    known=None,
-    awaiting=None,
-) -> PartialLeaveRequest:
-    try:
-        response = get_client().chat.completions.parse(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": get_smart_form_prompt(known, awaiting)},
-                {"role": "user", "content": user_input},
-            ],
-            response_format=PartialLeaveRequest,
-        )
-    except APIError as exc:
-        raise ExtractionError(str(exc)) from exc
+def _extract_once(user_input: str, known=None, awaiting=None, deadline_days=None) -> PartialIntakeRecord:
+    started = time.perf_counter()
+    response = get_client().chat.completions.parse(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": get_smart_form_prompt(known, awaiting, deadline_days=deadline_days),
+            },
+            {"role": "user", "content": user_input},
+        ],
+        response_format=PartialIntakeRecord,
+        max_tokens=MAX_TOKENS,
+    )
+    usage = getattr(response, "usage", None)
+    log_llm_usage(
+        getattr(usage, "prompt_tokens", 0) or 0,
+        getattr(usage, "completion_tokens", 0) or 0,
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+    )
 
     message = response.choices[0].message
-
-    if message.refusal:
-        raise ExtractionError(message.refusal)
-
-    if not message.parsed:
-        raise ExtractionError("the model returned an empty response")
-
+    if message.refusal or not message.parsed:
+        raise ExtractionError("the model did not return intake fields")
     return message.parsed
+
+
+def extract_turn(user_input: str, known=None, awaiting=None, deadline_days=None) -> PartialIntakeRecord:
+    last_error = None
+    for attempt in range(1, 1 + MAX_RETRIES + 1):
+        try:
+            return _extract_once(user_input, known, awaiting, deadline_days)
+        except ConfigurationError:
+            raise
+        except (APIError, ExtractionError) as exc:
+            last_error = ExtractionError(str(exc))
+            log_error(kind=type(exc).__name__, attempt=attempt)
+        except Exception:
+            last_error = ExtractionError("extraction failed")
+            log_error(kind="Exception", attempt=attempt)
+    raise ExtractionError("extraction failed after retries") from last_error

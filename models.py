@@ -1,91 +1,199 @@
-from datetime import date
+"""SmartIntake Pydantic models.
+
+PartialIntakeRecord = one turn (any field may be missing).
+IntakeRecord = the final five fields, only built when everything is valid.
+"""
+
 from typing import Literal, Optional, get_args
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-LeaveType = Literal["casual", "sick", "earned"]
+QueryType = Literal[
+    "complaint",
+    "submission",
+    "variation",
+    "safety_signal",
+    "label_update",
+    "inspection",
+    "general_enquiry",
+]
+RegulationRef = Literal[
+    "FDA_21CFR",
+    "EMA_CTR",
+    "ICH_E2A",
+    "ICH_Q10",
+    "CDSCO_NDC",
+    "GxP_GMP",
+    "GxP_GCP",
+    "other",
+]
+ProductArea = Literal[
+    "oncology",
+    "cardiovascular",
+    "infectious_disease",
+    "cmc",
+    "clinical",
+    "labelling",
+    "general",
+]
+Urgency = Literal["routine", "standard", "urgent", "critical"]
 
-LEAVE_TYPES = get_args(LeaveType)
+QUERY_TYPES = get_args(QueryType)
+REGULATION_REFS = get_args(RegulationRef)
+PRODUCT_AREAS = get_args(ProductArea)
+URGENCY_LEVELS = get_args(Urgency)
+
+FIELDS = [
+    "query_type",
+    "regulation_ref",
+    "product_area",
+    "urgency",
+    "submitting_team",
+]
+REQUIRED_FIELDS = FIELDS
+FIELD_ORDER = FIELDS
+BUSINESS_FIELDS = FIELDS
+
+KNOWN_TEAMS = {
+    "pv": "PV",
+    "cmc": "CMC",
+    "clinical": "Clinical",
+    "labelling": "Labelling",
+    "labeling": "Labelling",
+    "submissions": "Submissions",
+}
 
 
-def match_leave_type(value: str) -> Optional[str]:
-    """Map a phrase onto a supported leave type, or None if it does not fit one.
-
-    Users say "casual leave" rather than "casual", so an exact comparison alone
-    would reject perfectly good answers.
-    """
-    value = value.strip().lower()
-
-    if value in LEAVE_TYPES:
-        return value
-
-    matches = [name for name in LEAVE_TYPES if name in value]
-
-    return matches[0] if len(matches) == 1 else None
+def urgency_from_deadline_days(days: int) -> str:
+    if days <= 0:
+        return "critical"
+    if days <= 7:
+        return "urgent"
+    if days <= 30:
+        return "standard"
+    return "routine"
 
 
-class LeaveRequest(BaseModel):
-    employee_name: str = Field(min_length=2, description="Name of the employee")
-    employee_id: str = Field(min_length=2, description="Employee ID")
-    leave_type: LeaveType = Field(description="Type of leave")
-    start_date: date = Field(description="Leave start date")
-    end_date: date = Field(description="Leave end date")
+def _pick(value, allowed) -> Optional[str]:
+    """Return the allowed value if it matches, otherwise None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text in allowed:
+        return text
+    lowered = text.lower().replace(" ", "_").replace("-", "_")
+    for item in allowed:
+        if lowered == item.lower():
+            return item
+    return None
 
-    reason: Optional[str] = Field(
+
+def match_query_type(value: str) -> Optional[str]:
+    return _pick(value, QUERY_TYPES)
+
+
+def match_product_area(value: str) -> Optional[str]:
+    return _pick(value, PRODUCT_AREAS)
+
+
+def match_regulation_ref(value: str) -> Optional[str]:
+    matched = _pick(value, REGULATION_REFS)
+    if matched:
+        return matched
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    short = {
+        "fda": "FDA_21CFR",
+        "21cfr": "FDA_21CFR",
+        "ema": "EMA_CTR",
+        "e2a": "ICH_E2A",
+        "q10": "ICH_Q10",
+        "cdsco": "CDSCO_NDC",
+        "gmp": "GxP_GMP",
+        "gcp": "GxP_GCP",
+    }
+    compact = text.replace(" ", "").replace("-", "").replace("_", "")
+    if compact in short:
+        return short[compact]
+    if "mhra" in text:
+        return "other"
+    return None
+
+
+def normalize_submitting_team(value: str) -> Optional[str]:
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in KNOWN_TEAMS:
+        return KNOWN_TEAMS[lowered]
+    if "team" in lowered:
+        return text.title()
+    parts = text.split()
+    if len(parts) >= 2 and all(part.isalpha() for part in parts):
+        return None
+    if text.istitle() and text.isalpha() and lowered not in KNOWN_TEAMS:
+        return None
+    return text
+
+
+class PartialIntakeRecord(BaseModel):
+    query_type: Optional[QueryType] = None
+    regulation_ref: Optional[RegulationRef] = None
+    product_area: Optional[ProductArea] = None
+    urgency: Optional[Urgency] = None
+    submitting_team: Optional[str] = None
+    deadline_days: Optional[int] = Field(
         default=None,
-        description="Reason for the leave. Return null if not provided."
+        description="Days until the stated deadline. Tomorrow=1. Null if none given.",
     )
-
-    @model_validator(mode="after")
-    def validate_dates(self):
-        if self.end_date < self.start_date:
-            raise ValueError("End date cannot be before start date.")
-
-        return self
-
-
-class PartialLeaveRequest(BaseModel):
-    """A single turn's extraction: any field the user did not mention stays None."""
-
-    employee_name: Optional[str] = None
-    employee_id: Optional[str] = None
-    leave_type: Optional[LeaveType] = None
-    start_date: Optional[date] = None
-    end_date: Optional[date] = None
-    reason: Optional[str] = None
+    out_of_scope: bool = False
 
     @model_validator(mode="before")
     @classmethod
-    def drop_implausible(cls, data):
-        """Turn unusable answers into None so the caller re-asks instead of failing.
-
-        The model sometimes echoes a stray keystroke back as the answer to whatever
-        was just asked. Discarding it here keeps that out of the state without
-        raising, which would abort the turn.
-        """
+    def clean(cls, data):
         if not isinstance(data, dict):
             return data
-
         cleaned = dict(data)
-
-        leave_type = cleaned.get("leave_type")
-
-        if isinstance(leave_type, str):
-            cleaned["leave_type"] = match_leave_type(leave_type)
-
-        for name in ("employee_name", "employee_id", "reason"):
-            value = cleaned.get(name)
-
-            if isinstance(value, str) and len(value.strip()) < 2:
-                cleaned[name] = None
-
+        if isinstance(cleaned.get("query_type"), str):
+            cleaned["query_type"] = match_query_type(cleaned["query_type"])
+        if isinstance(cleaned.get("regulation_ref"), str):
+            cleaned["regulation_ref"] = match_regulation_ref(cleaned["regulation_ref"])
+        if isinstance(cleaned.get("product_area"), str):
+            cleaned["product_area"] = match_product_area(cleaned["product_area"])
+        if isinstance(cleaned.get("submitting_team"), str):
+            cleaned["submitting_team"] = normalize_submitting_team(cleaned["submitting_team"])
+        days = cleaned.get("deadline_days")
+        if isinstance(days, str) and days.strip().lstrip("-").isdigit():
+            cleaned["deadline_days"] = int(days.strip())
+        elif days in ("", None):
+            cleaned["deadline_days"] = None
+        cleaned["urgency"] = None
         return cleaned
 
+    @model_validator(mode="after")
+    def set_urgency_from_deadline(self):
+        if self.deadline_days is None:
+            self.urgency = None
+        else:
+            self.urgency = urgency_from_deadline_days(self.deadline_days)
+        return self
 
-FIELD_ORDER = list(PartialLeaveRequest.model_fields)
 
-REQUIRED_FIELDS = [
-    name
-    for name, field in LeaveRequest.model_fields.items()
-    if field.is_required()
-]
+class IntakeRecord(BaseModel):
+    query_type: QueryType
+    regulation_ref: RegulationRef
+    product_area: ProductArea
+    urgency: Urgency
+    submitting_team: str = Field(min_length=1)
+
+    @field_validator("submitting_team")
+    @classmethod
+    def must_be_a_team(cls, value: str) -> str:
+        team = normalize_submitting_team(value)
+        if not team:
+            raise ValueError("submitting_team must be a team, not a person's name")
+        return team

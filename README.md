@@ -1,74 +1,44 @@
-# Smart Forms
+# SmartIntake
 
-Fill in a structured form by talking to it. Instead of presenting an employee with
-a leave-request form, this app collects the same information through conversation,
-asks about whatever is still missing, and only submits once every required field
-passes validation.
+Talk through a pharmaceutical regulatory query. The app extracts five fields,
+asks for anything missing, shows a summary, and saves JSON only after you confirm.
 
-Built on the OpenAI API with structured output, Pydantic for validation, and
-Streamlit for the interface.
+No LangChain. OpenAI SDK extracts fields, Pydantic validates them, and ordinary
+Python keeps conversation state.
 
-## What it does
+## The five fields
 
-Describe a leave request in plain language and the assistant extracts what it can:
-
-```
-You: I am Varad, employee ID E1024, casual leave
-Assistant: Got employee name Varad, employee id E1024, leave type casual leave.
-Assistant: Which date does the leave start?
-You: September 10 to September 12
-Assistant: All set, I have submitted this request.
-```
-
-Things it handles:
-
-- **Partial information.** Give one field or all six, in any order.
-- **Bare answers.** Replying just `E1024` works, because the model is told which
-  question was asked.
-- **Corrections.** Saying "make it sick leave instead" overwrites the earlier value.
-- **Relative dates.** "September 10" resolves against today's date, never a past year.
-- **Bad data.** An end date before the start date is rejected and re-asked.
-- **Junk answers.** Leave type is constrained to `casual`, `sick` or `earned`, and a
-  stray reply like `w` is discarded rather than stored, so the question is asked again.
-  Natural phrasing such as "casual leave" still maps onto the right value.
-
-## Project structure
-
-| File | Purpose |
+| Field | Values |
 | --- | --- |
-| `streamlit_app.py` | Streamlit chat UI with a live form-progress sidebar |
-| `app.py` | Terminal version of the same conversation |
-| `flow.py` | Turn orchestration shared by both front ends |
-| `conversation.py` | `ConversationState` — accumulates answers across turns |
-| `llm_service.py` | OpenAI client and per-turn extraction |
-| `prompts.py` | System prompt, field labels, and the questions to ask |
-| `models.py` | `LeaveRequest` (strict) and `PartialLeaveRequest` (per turn) |
-| `tools.py` | Stand-in for the real submission backend |
+| `query_type` | complaint, submission, variation, safety_signal, label_update, inspection, general_enquiry |
+| `regulation_ref` | FDA_21CFR, EMA_CTR, ICH_E2A, ICH_Q10, CDSCO_NDC, GxP_GMP, GxP_GCP, other |
+| `product_area` | oncology, cardiovascular, infectious_disease, cmc, clinical, labelling, general |
+| `urgency` | routine, standard, urgent, critical |
+| `submitting_team` | a team name (PV, CMC, Clinical, …), never a person |
+
+Urgency comes from the deadline, not from words like ASAP:
+
+- due today / overdue → critical
+- 1–7 days → urgent
+- 8–30 days → standard
+- more than 30 days → routine
+- no deadline → ask for one
+
+MHRA (and other unlisted frameworks) → `other`.
 
 ## How it works
 
-Each user message goes through the same five steps in `flow.process_turn`:
-
-1. **Extract.** `llm_service.extract_turn` sends the message to OpenAI with
-   `response_format=PartialLeaveRequest`, so the reply is JSON matching that model.
-   The system prompt includes today's date, the fields already recorded, and the
-   question just asked — that context is what makes bare replies and corrections work.
-2. **Merge.** `ConversationState.update_from` copies over only the fields that came
-   back non-`None`. This is what makes the conversation cumulative: a turn mentioning
-   just the leave type must not erase the name captured three turns ago.
-3. **Check.** `missing_required_fields()` reports what is still absent, and the front
-   end asks about the first one.
-4. **Validate.** Once nothing is missing, `to_leave_request()` builds a real
-   `LeaveRequest`. Pydantic enforces the types and the end-after-start rule here.
-5. **Submit.** `tools.submit_leave_request` is called and the state resets.
-
-`LeaveRequest` is the single source of truth for what "required" means —
-`REQUIRED_FIELDS` in `models.py` is derived from it by introspection, so the questions
-asked can never drift from what validation actually demands.
+```
+You type
+  → prompt + OpenAI structured output
+  → Pydantic (PartialIntakeRecord)
+  → ConversationState keeps known fields
+  → ask if something is missing
+  → if complete, confirm
+  → yes → output/intake_<timestamp>.json
+```
 
 ## Setup
-
-Requires Python 3.10 or newer.
 
 ```powershell
 python -m venv .venv
@@ -76,76 +46,27 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-On macOS or Linux, activate with `source .venv/bin/activate` instead.
-
-### API key
-
-Create a key at [OpenAI Platform](https://platform.openai.com/api-keys), then copy
-`.env.example` to `.env` and set your key:
-
-```
-OPENAI_API_KEY=your_key_here
-OPENAI_MODEL=gpt-4o-mini
-```
-
-`.env` is gitignored. `OPENAI_MODEL` is optional and defaults to `gpt-4o-mini`.
-
-## Running
-
-Streamlit UI, served at http://localhost:8501:
-
-```powershell
-streamlit run streamlit_app.py
-```
-
-Or the terminal version:
+Copy `.env.example` to `.env` and set `OPENAI_API_KEY`.
 
 ```powershell
 python app.py
 ```
 
-Type `quit` to leave the CLI.
-
-## Deploying to Streamlit Cloud
-
-`.env` is gitignored, so a deployed app has no key and cannot read one from the
-environment. Supply it through the app's secrets instead: open the app on
-[share.streamlit.io](https://share.streamlit.io), go to **Settings > Secrets**, and add
-
-```toml
-OPENAI_API_KEY = "your_key_here"
-OPENAI_MODEL = "gpt-4o-mini"
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-`llm_service.get_setting` checks environment variables first and falls back to
-`st.secrets`, so the same code works locally and deployed. If the key is missing the
-app shows a message saying so rather than crashing with a traceback.
+## Files
 
-To test secrets locally, put the same TOML in `.streamlit/secrets.toml` — that path is
-gitignored.
+| File | Role |
+| --- | --- |
+| `app.py` | CLI |
+| `flow.py` | One turn: extract, merge, ask, confirm, save |
+| `conversation.py` | Fields remembered across turns |
+| `llm_service.py` | OpenAI call |
+| `prompts.py` | System prompt and questions |
+| `models.py` | Partial + final Pydantic models |
+| `storage.py` | Confirmed JSON under `output/` |
+| `audit.py` | Token log in `debug.json` |
 
-## Testing
-
-The Streamlit app can be driven headlessly, without a browser:
-
-```python
-from streamlit.testing.v1 import AppTest
-
-at = AppTest.from_file("streamlit_app.py", default_timeout=90)
-at.run()
-at.chat_input[0].set_value("I am Varad, employee ID E1024, casual leave").run()
-
-print(at.session_state.state.get_state())
-```
-
-Each simulated turn makes a real API call. The state logic in `conversation.py` can be
-tested without any calls by constructing `PartialLeaveRequest` objects directly and
-passing them to `update_from`.
-
-## Possible next steps
-
-- Preserve employee name and ID across submissions instead of clearing every field.
-- Let the user unset an optional field; `update_from` currently ignores `None`, so
-  "actually there's no reason" cannot clear `reason`.
-- Persist submissions somewhere real rather than printing them.
-- Support more form types by generalising `LeaveRequest` into one schema among several.
+Confirmed records and `debug.json` both use `log_safe: true` and never store the raw user message.

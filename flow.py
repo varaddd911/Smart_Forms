@@ -1,85 +1,110 @@
-"""Turn handling shared by the CLI and the Streamlit UI."""
+"""One user message in, one TurnResult out."""
 
 from dataclasses import dataclass, field
 from typing import Optional
 
-from pydantic import ValidationError
-
 from conversation import ConversationState
 from llm_service import ExtractionError, extract_turn
-from models import FIELD_ORDER, LeaveRequest
-from prompts import FIELD_LABELS
-from tools import submit_leave_request
+from models import IntakeRecord
+from prompts import FIELD_LABELS, OUT_OF_SCOPE_MESSAGE
+from storage import save_intake_record
+
+YES = {"yes", "y", "correct", "confirm", "confirmed", "looks good", "ok", "okay"}
 
 
 @dataclass
 class TurnResult:
-    """What a single user message did to the conversation."""
-
     changed: list[str] = field(default_factory=list)
     values: dict = field(default_factory=dict)
     next_field: Optional[str] = None
-    submitted: Optional[LeaveRequest] = None
     error: Optional[str] = None
     unrecognised: Optional[str] = None
+    out_of_scope: bool = False
+    fallback_message: Optional[str] = None
+    awaiting_confirmation: bool = False
+    confirmation_message: Optional[str] = None
+    saved_record: Optional[IntakeRecord] = None
+    saved_path: Optional[str] = None
 
 
-def process_turn(
-    state: ConversationState,
-    user_input: str,
-    awaiting: Optional[str] = None,
-) -> TurnResult:
+def is_user_confirmation(text: str) -> bool:
+    return " ".join(text.lower().strip().replace(".", "").split()) in YES
+
+
+def confirmation_message(record: IntakeRecord) -> str:
+    return (
+        "Please confirm the following regulatory intake:\n"
+        f"Query type: {record.query_type.replace('_', ' ').title()}\n"
+        f"Regulation reference: {record.regulation_ref}\n"
+        f"Product area: {record.product_area.replace('_', ' ').title()}\n"
+        f"Urgency: {record.urgency.title()}\n"
+        f"Submitting team: {record.submitting_team}\n"
+        "\nPlease confirm if these details are correct."
+    )
+
+
+def describe_changes(changed: list[str], values: dict) -> str:
+    return ", ".join(f"{FIELD_LABELS[name].lower()} {values[name]}" for name in changed)
+
+
+def process_turn(state: ConversationState, user_input: str, awaiting: Optional[str] = None) -> TurnResult:
+    state.turns_taken += 1
+
+    if state.awaiting_confirmation and is_user_confirmation(user_input):
+        path = save_intake_record(state.pending_record, state.turns_taken)
+        saved = state.pending_record
+        result = TurnResult(values=saved.model_dump(), saved_record=saved, saved_path=str(path))
+        state.reset()
+        return result
+
     try:
         partial = extract_turn(
             user_input,
             known=state.get_state(),
             awaiting=awaiting,
+            deadline_days=state.deadline_days,
         )
     except ExtractionError as exc:
+        missing = state.missing_required_fields()
         return TurnResult(
             values=state.get_state(),
-            next_field=awaiting,
+            next_field=awaiting or (missing[0] if missing else "query_type"),
             error=f"I could not read that ({exc})",
+            awaiting_confirmation=state.awaiting_confirmation,
+            confirmation_message=(
+                confirmation_message(state.pending_record) if state.pending_record else None
+            ),
+        )
+
+    if partial.out_of_scope:
+        missing = state.missing_required_fields()
+        return TurnResult(
+            values=state.get_state(),
+            next_field=missing[0] if missing else None,
+            out_of_scope=True,
+            fallback_message=OUT_OF_SCOPE_MESSAGE,
+            awaiting_confirmation=state.awaiting_confirmation,
+            confirmation_message=(
+                confirmation_message(state.pending_record) if state.pending_record else None
+            ),
         )
 
     changed = state.update_from(partial)
-
-    # Snapshot before any clearing below, so callers can still report what landed.
+    missing = state.missing_required_fields()
     values = state.get_state()
 
-    missing = state.missing_required_fields()
-
     if missing:
-        # We asked for a field and the turn still did not produce it.
+        state.awaiting_confirmation = False
+        state.pending_record = None
         stuck = awaiting if awaiting == missing[0] and awaiting not in changed else None
+        return TurnResult(changed=changed, values=values, next_field=missing[0], unrecognised=stuck)
 
-        return TurnResult(
-            changed=changed,
-            values=values,
-            next_field=missing[0],
-            unrecognised=stuck,
-        )
-
-    try:
-        leave_request = state.to_leave_request()
-    except ValidationError as exc:
-        state.clear("start_date", "end_date")
-
-        return TurnResult(
-            changed=changed,
-            values=values,
-            next_field="start_date",
-            error=exc.errors()[0]["msg"],
-        )
-
-    submit_leave_request(leave_request)
-    state.clear(*FIELD_ORDER)
-
-    return TurnResult(changed=changed, values=values, submitted=leave_request)
-
-
-def describe_changes(changed: list[str], values: dict) -> str:
-    return ", ".join(
-        f"{FIELD_LABELS[field].lower()} {values[field]}"
-        for field in changed
+    record = state.to_intake_record()
+    state.pending_record = record
+    state.awaiting_confirmation = True
+    return TurnResult(
+        changed=changed,
+        values=values,
+        awaiting_confirmation=True,
+        confirmation_message=confirmation_message(record),
     )
