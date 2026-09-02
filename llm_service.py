@@ -15,7 +15,7 @@ load_dotenv(override=True)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_RETRIES = 2
-MAX_TOKENS = 400
+MAX_TOKENS = 300
 
 
 class ExtractionError(RuntimeError):

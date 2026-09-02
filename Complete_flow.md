@@ -19,7 +19,7 @@ The job is intake, not a chatbot and not a one-shot extractor.
 | --- | --- |
 | The user may give one field or all five | Multi-turn conversation, not a single API call |
 | The model can guess or invent | Pydantic checks values; Python refuses to save incomplete records |
-| Tone words like "ASAP" are not a deadline | Urgency is computed from `deadline_days`, never from emotion |
+| Tone words like "ASAP" are not a deadline | Urgency is computed from domain rules and `deadline_days`, never from emotion |
 | A wrong save is worse than a slow save | Confirmation happens before `output/` is written |
 | Regulatory text is sensitive | Stored JSON and `debug.json` never contain the raw user message |
 | The code must be easy to explain | OpenAI SDK + Pydantic + ordinary Python. No LangChain |
@@ -41,16 +41,18 @@ The final record has exactly these business fields:
 4. `urgency` — routine, standard, urgent, critical
 5. `submitting_team` — a team or function (PV, CMC, Clinical, Labelling, Submissions, …), never a person
 
-`deadline_days` and `out_of_scope` exist only during the conversation. They are
-not written to the saved JSON.
+`deadline_days`, `is_expedited_safety`, `is_form_483`, and `out_of_scope` exist
+only during the conversation. They are not written to the saved JSON.
 
 Urgency mapping (Python, not the LLM):
 
-- due today or overdue → `critical`
-- 1–7 days (including tomorrow) → `urgent`
-- 8–30 days → `standard`
-- more than 30 days → `routine`
-- no usable deadline → field stays empty and the app asks for a date
+- SUSAR / ICH E2A expedited safety report → `critical`
+- FDA Form 483 → `urgent`
+- otherwise ≤48 hours (including tomorrow) → `critical`
+- otherwise ≤3 days → `urgent`
+- otherwise ≤14 days → `standard`
+- otherwise weeks–months → `routine`
+- no usable deadline and none of those domain triggers → field stays empty and the app asks for a date
 
 ---
 
@@ -119,7 +121,7 @@ Empty input is ignored. `quit` / `exit` ends the loop. Anything else is one
 - says do not treat ASAP as a deadline
 - says a person is not a `submitting_team`
 - includes already-recorded values so the model does not wipe them with null
-- includes two few-shot examples
+- includes two few-shot examples and three negatives (tone, person-as-team, citation beats agency name)
 
 If the app just asked a question, the prompt also says which field that question
 was about. That is why a bare answer such as `"inspection"` can be mapped.
@@ -130,8 +132,8 @@ scattered through `flow.py`.
 ### 3. OpenAI SDK — `llm_service.py`
 
 `extract_turn` calls `chat.completions.parse` with
-`response_format=PartialIntakeRecord`. The model must return JSON that matches
-the Pydantic model, not free prose.
+`response_format=PartialIntakeRecord` and `max_tokens=300`. The model must
+return JSON that matches the Pydantic model, not free prose.
 
 If the call fails, it retries at most twice (three attempts total), then raises
 `ExtractionError`. The app does not crash and does not invent values.
@@ -157,8 +159,9 @@ Two models on purpose:
 
 - **`PartialIntakeRecord`** — used every turn. Any field may be `None`. Invalid
   enum values become `None` instead of raising, so the conversation can ask
-  again. `urgency` from the model is discarded. If `deadline_days` is present,
-  Python sets urgency from the deadline table.
+  again. `urgency` from the model is discarded. Python sets urgency from SUSAR /
+  Form 483 flags and the deadline table. `refine_partial` then prefers an
+  explicit ICH E2A / SUSAR citation over an agency name such as EMA.
 - **`IntakeRecord`** — used only when all five fields are filled. Strict types.
   Empty team and person names (`John`) are rejected.
 
@@ -167,8 +170,8 @@ must not.
 
 ### 5. Conversation state — `conversation.py`
 
-`ConversationState` holds the five fields plus `deadline_days`, `turns_taken`,
-and a pending record waiting for confirmation.
+`ConversationState` holds the five fields plus `deadline_days`, the SUSAR and
+Form 483 flags, `turns_taken`, and a pending record waiting for confirmation.
 
 `update_from` copies only non-`None` values. `None` means "this turn did not
 mention the field", not "clear it". That is what makes the conversation
@@ -184,14 +187,18 @@ order.
 1. Count the turn.
 2. If a confirmation is pending and the user said yes / confirm / looks good →
    save and reset. Stop.
-3. Otherwise call the LLM and get a `PartialIntakeRecord`.
-4. If that fails → return an error and re-ask. Do not change state.
-5. If `out_of_scope` → explain that SmartIntake is for regulatory intake. Do
+3. If a confirmation is pending and the user said a bare `no` / `nope` /
+   `incorrect` / `wrong` → do **not** call OpenAI. Ask which of the five fields
+   to change. Stay in confirmation.
+4. Otherwise call the LLM and get a `PartialIntakeRecord`. A longer correction
+   such as `no, regulation is ICH E2A` updates only the mentioned field.
+5. If that fails → return an error and re-ask. Do not change state.
+6. If `out_of_scope` → explain that SmartIntake is for regulatory intake. Do
    not force a `query_type`.
-6. Merge into `ConversationState`.
-7. If something is still missing → set `next_field` so the CLI asks
+7. Merge into `ConversationState`.
+8. If something is still missing → set `next_field` so the CLI asks
    `QUESTIONS[next_field]`.
-8. If all five fields are valid → store `pending_record` and return a
+9. If all five fields are valid → store `pending_record` and return a
    confirmation message. **Do not save.**
 
 The LLM extracts. `flow.py` decides what happens next.
@@ -222,7 +229,8 @@ Please confirm if these details are correct.
 Nothing is in `output/` yet.
 
 - `yes` / `correct` / `confirm` / `looks good` → save
-- a correction such as `PV will handle it instead` → merge, validate, confirm again
+- a bare `no` → list the five fields; stay in confirmation; do not call OpenAI
+- a correction such as `PV will handle it instead` → merge that field, confirm again
 
 **Why confirm before save:** intake records are audit artefacts. A silent wrong
 save is worse than one extra turn.
@@ -313,13 +321,13 @@ submitting_team   None
 **You:** CMC will handle it and the response is due tomorrow.
 
 Extraction: `submitting_team=CMC`, `deadline_days=1`, `urgency` left null by the
-model. Pydantic sets `urgency=urgent` because 1 day is in the 1–7 day band.
+model. Pydantic sets `urgency=critical` because tomorrow is within 48 hours.
 
 ```
 query_type        inspection
 regulation_ref    FDA_21CFR
 product_area      oncology
-urgency           urgent
+urgency           critical
 submitting_team   CMC
 ```
 
@@ -345,7 +353,12 @@ deadline). The app skips the questions and goes straight to confirmation.
 
 **Correction.** After the summary, the user says `PV will handle it instead`.
 The team is updated, the other four fields stay, confirmation is shown again,
-save still waits for `yes`.
+save still waits for `yes`. A regulation-only correction such as
+`no, regulation is ICH E2A` does not cascade into the other fields.
+
+**Bare no.** After the summary, `no` does not mark the query out of scope.
+The app asks which field to change. Urgency can only be changed by giving a
+deadline, not by typing `critical`.
 
 **Out of scope.** "What should I cook for dinner?" → `out_of_scope=true`.
 The assistant explains SmartIntake is for regulatory intake. Existing fields

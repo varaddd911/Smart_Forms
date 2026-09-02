@@ -5,11 +5,12 @@ from typing import Optional
 
 from conversation import ConversationState
 from llm_service import ExtractionError, extract_turn
-from models import IntakeRecord
-from prompts import FIELD_LABELS, OUT_OF_SCOPE_MESSAGE
+from models import IntakeRecord, refine_partial
+from prompts import CHANGE_FIELD_MESSAGE, FIELD_LABELS, OUT_OF_SCOPE_MESSAGE
 from storage import save_intake_record
 
 YES = {"yes", "y", "correct", "confirm", "confirmed", "looks good", "ok", "okay"}
+NO = {"no", "n", "nope", "incorrect", "wrong"}
 
 
 @dataclass
@@ -27,8 +28,16 @@ class TurnResult:
     saved_path: Optional[str] = None
 
 
+def _normalise(text: str) -> str:
+    return " ".join(text.lower().strip().replace(".", "").replace("!", "").split())
+
+
 def is_user_confirmation(text: str) -> bool:
-    return " ".join(text.lower().strip().replace(".", "").split()) in YES
+    return _normalise(text) in YES
+
+
+def is_bare_rejection(text: str) -> bool:
+    return _normalise(text) in NO
 
 
 def confirmation_message(record: IntakeRecord) -> str:
@@ -57,6 +66,13 @@ def process_turn(state: ConversationState, user_input: str, awaiting: Optional[s
         state.reset()
         return result
 
+    if state.awaiting_confirmation and is_bare_rejection(user_input):
+        return TurnResult(
+            values=state.get_state(),
+            awaiting_confirmation=True,
+            confirmation_message=CHANGE_FIELD_MESSAGE,
+        )
+
     try:
         partial = extract_turn(
             user_input,
@@ -64,6 +80,7 @@ def process_turn(state: ConversationState, user_input: str, awaiting: Optional[s
             awaiting=awaiting,
             deadline_days=state.deadline_days,
         )
+        partial = refine_partial(partial, user_input)
     except ExtractionError as exc:
         missing = state.missing_required_fields()
         return TurnResult(

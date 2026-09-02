@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from models import FIELDS, IntakeRecord, PartialIntakeRecord
+from models import FIELDS, IntakeRecord, PartialIntakeRecord, resolve_urgency
 
 
 class ConversationState:
@@ -13,6 +13,8 @@ class ConversationState:
         self.urgency = None
         self.submitting_team = None
         self.deadline_days = None
+        self.is_expedited_safety = False
+        self.is_form_483 = False
         self.turns_taken = 0
         self.awaiting_confirmation = False
         self.pending_record: Optional[IntakeRecord] = None
@@ -31,7 +33,23 @@ class ConversationState:
             setattr(self, name, value)
             if name in FIELDS:
                 changed.append(name)
-        return changed
+
+        if data.get("is_expedited_safety"):
+            self.is_expedited_safety = True
+        if data.get("is_form_483"):
+            self.is_form_483 = True
+
+        computed = resolve_urgency(
+            deadline_days=self.deadline_days,
+            is_expedited_safety=self.is_expedited_safety,
+            is_form_483=self.is_form_483,
+        )
+        if computed != self.urgency:
+            self.urgency = computed
+            if "urgency" not in changed:
+                changed.append("urgency")
+
+        return [name for name in changed if name in FIELDS]
 
     def missing_required_fields(self) -> list[str]:
         return [name for name in FIELDS if getattr(self, name) is None]

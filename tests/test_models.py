@@ -9,6 +9,8 @@ from models import (
     match_regulation_ref,
     match_product_area,
     normalize_submitting_team,
+    refine_partial,
+    resolve_urgency,
     urgency_from_deadline_days,
 )
 
@@ -69,6 +71,10 @@ class TestIntakeRecord(unittest.TestCase):
             IntakeRecord(**self.valid_payload(submitting_team="labelling")).submitting_team,
             "Labelling",
         )
+        self.assertEqual(
+            IntakeRecord(**self.valid_payload(submitting_team="cmc regulatory")).submitting_team,
+            "CMC Regulatory",
+        )
 
 
 class TestMatching(unittest.TestCase):
@@ -99,11 +105,22 @@ class TestDeadlineUrgency(unittest.TestCase):
     def test_deadline_mapping(self):
         self.assertEqual(urgency_from_deadline_days(0), "critical")
         self.assertEqual(urgency_from_deadline_days(-1), "critical")
-        self.assertEqual(urgency_from_deadline_days(1), "urgent")
-        self.assertEqual(urgency_from_deadline_days(7), "urgent")
+        self.assertEqual(urgency_from_deadline_days(1), "critical")
+        self.assertEqual(urgency_from_deadline_days(2), "critical")
+        self.assertEqual(urgency_from_deadline_days(3), "urgent")
         self.assertEqual(urgency_from_deadline_days(10), "standard")
-        self.assertEqual(urgency_from_deadline_days(30), "standard")
+        self.assertEqual(urgency_from_deadline_days(14), "standard")
+        self.assertEqual(urgency_from_deadline_days(15), "routine")
         self.assertEqual(urgency_from_deadline_days(45), "routine")
+
+    def test_susar_is_critical_even_at_fifteen_days(self):
+        self.assertEqual(
+            resolve_urgency(deadline_days=15, is_expedited_safety=True),
+            "critical",
+        )
+
+    def test_form_483_is_urgent(self):
+        self.assertEqual(resolve_urgency(deadline_days=15, is_form_483=True), "urgent")
 
     def test_tone_does_not_set_urgency(self):
         partial = PartialIntakeRecord(urgency="urgent")
@@ -111,10 +128,41 @@ class TestDeadlineUrgency(unittest.TestCase):
         self.assertIsNone(partial.deadline_days)
 
     def test_deadline_sets_urgency_on_partial(self):
-        partial = PartialIntakeRecord(deadline_days=1)
-        self.assertEqual(partial.urgency, "urgent")
-        ten_days = PartialIntakeRecord(deadline_days=10)
-        self.assertEqual(ten_days.urgency, "standard")
+        self.assertEqual(PartialIntakeRecord(deadline_days=1).urgency, "critical")
+        self.assertEqual(PartialIntakeRecord(deadline_days=10).urgency, "standard")
+
+    def test_asap_without_deadline_does_not_set_urgency(self):
+        self.assertIsNone(resolve_urgency(deadline_days=None))
+        self.assertIsNone(PartialIntakeRecord().urgency)
+
+    def test_refine_partial_prefers_ich_e2a_over_ema(self):
+        wrong = PartialIntakeRecord(
+            query_type="safety_signal",
+            regulation_ref="EMA_CTR",
+            product_area="clinical",
+            submitting_team="PV",
+            deadline_days=15,
+        )
+        refined = refine_partial(
+            wrong,
+            "PV team here. We have a new serious unexpected SUSAR for the Phase III "
+            "trial and need to notify EMA within 15 days per ICH E2A",
+        )
+        self.assertEqual(refined.regulation_ref, "ICH_E2A")
+        self.assertTrue(refined.is_expedited_safety)
+        self.assertEqual(refined.urgency, "critical")
+        self.assertEqual(refined.product_area, "clinical")
+        self.assertEqual(refined.submitting_team, "PV")
+
+    def test_refine_partial_marks_form_483(self):
+        refined = refine_partial(
+            PartialIntakeRecord(deadline_days=15),
+            "We need to respond to an FDA Form 483 within 15 business days.",
+        )
+        self.assertTrue(refined.is_form_483)
+        self.assertEqual(refined.query_type, "inspection")
+        self.assertEqual(refined.regulation_ref, "FDA_21CFR")
+        self.assertEqual(refined.urgency, "urgent")
 
 
 class TestPartialExtraction(unittest.TestCase):

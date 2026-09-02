@@ -61,17 +61,61 @@ KNOWN_TEAMS = {
     "labelling": "Labelling",
     "labeling": "Labelling",
     "submissions": "Submissions",
+    "cmc regulatory": "CMC Regulatory",
 }
 
 
-def urgency_from_deadline_days(days: int) -> str:
-    if days <= 0:
+def resolve_urgency(
+    deadline_days: Optional[int] = None,
+    is_expedited_safety: bool = False,
+    is_form_483: bool = False,
+) -> Optional[str]:
+    """Domain urgency from the primer — not from words like ASAP.
+
+    critical: ≤48 hours, or a legally mandated expedited safety report (SUSAR / ICH E2A)
+    urgent: 24–72 hours, or an FDA Form 483 response
+    standard: days to 2 weeks
+    routine: weeks to months
+    """
+    if is_expedited_safety:
         return "critical"
-    if days <= 7:
+    if is_form_483:
         return "urgent"
-    if days <= 30:
+    if deadline_days is None:
+        return None
+    if deadline_days <= 2:
+        return "critical"
+    if deadline_days <= 3:
+        return "urgent"
+    if deadline_days <= 14:
         return "standard"
     return "routine"
+
+
+def urgency_from_deadline_days(days: int) -> str:
+    return resolve_urgency(deadline_days=days) or "routine"
+
+
+def refine_partial(partial: "PartialIntakeRecord", user_input: str) -> "PartialIntakeRecord":
+    """Prefer an explicit guideline citation over an agency name (EMA vs ICH E2A)."""
+    text = user_input.lower()
+    compact = text.replace(" ", "").replace("-", "").replace("_", "")
+    data = partial.model_dump()
+
+    if "iche2a" in compact or "susar" in text:
+        data["regulation_ref"] = "ICH_E2A"
+        data["is_expedited_safety"] = True
+        if data.get("query_type") is None:
+            data["query_type"] = "safety_signal"
+
+    if "483" in text:
+        data["is_form_483"] = True
+        if data.get("query_type") is None:
+            data["query_type"] = "inspection"
+        if data.get("regulation_ref") is None:
+            data["regulation_ref"] = "FDA_21CFR"
+
+    return PartialIntakeRecord(**data)
 
 
 def _pick(value, allowed) -> Optional[str]:
@@ -150,6 +194,14 @@ class PartialIntakeRecord(BaseModel):
         default=None,
         description="Days until the stated deadline. Tomorrow=1. Null if none given.",
     )
+    is_expedited_safety: bool = Field(
+        default=False,
+        description="True for SUSAR / ICH E2A expedited safety reporting.",
+    )
+    is_form_483: bool = Field(
+        default=False,
+        description="True for an FDA Form 483 inspection observation.",
+    )
     out_of_scope: bool = False
 
     @model_validator(mode="before")
@@ -175,11 +227,12 @@ class PartialIntakeRecord(BaseModel):
         return cleaned
 
     @model_validator(mode="after")
-    def set_urgency_from_deadline(self):
-        if self.deadline_days is None:
-            self.urgency = None
-        else:
-            self.urgency = urgency_from_deadline_days(self.deadline_days)
+    def set_urgency_from_domain_rules(self):
+        self.urgency = resolve_urgency(
+            deadline_days=self.deadline_days,
+            is_expedited_safety=self.is_expedited_safety,
+            is_form_483=self.is_form_483,
+        )
         return self
 
 

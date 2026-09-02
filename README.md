@@ -16,13 +16,15 @@ Python keeps conversation state.
 | `urgency` | routine, standard, urgent, critical |
 | `submitting_team` | a team name (PV, CMC, Clinical, …), never a person |
 
-Urgency comes from the deadline, not from words like ASAP:
+Urgency comes from domain rules and the deadline, never from words like ASAP:
 
-- due today / overdue → critical
-- 1–7 days → urgent
-- 8–30 days → standard
-- more than 30 days → routine
-- no deadline → ask for one
+- SUSAR / ICH E2A expedited safety report → `critical` (even at 15 days)
+- FDA Form 483 response → `urgent` (including a 15-business-day window)
+- otherwise ≤48 hours → `critical`
+- otherwise ≤3 days → `urgent`
+- otherwise ≤2 weeks → `standard`
+- otherwise weeks–months → `routine`
+- no deadline and none of those domain triggers → ask for a date
 
 MHRA (and other unlisted frameworks) → `other`.
 
